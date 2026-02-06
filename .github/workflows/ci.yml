@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      run_provider_smoke:
+        description: Run provider-backed smoke tests (requires provider API secrets)
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+  provider-smoke:
+    runs-on: ubuntu-latest
+    needs: verify
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+      BASE_URL: http://localhost:3001
+      RUN_PROVIDERS: '1'
+      RUN_PROVIDER_SMOKE_INPUT: ${{ github.event.inputs.run_provider_smoke || 'false' }}
+      EVENT_NAME: ${{ github.event_name }}
+
+    steps:
+      - name: Decide whether provider smoke should run
+        id: precheck
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ "${RUN_PROVIDER_SMOKE_INPUT}" = "true" ]; then
+            if [ -n "${OPENAI_API_KEY}" ] && [ -n "${DEEPSEEK_API_KEY}" ] && [ -n "${ANTHROPIC_API_KEY}" ]; then
+              echo "should_run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Skipping provider smoke: manual run requested but required provider secrets are missing."
+              echo "should_run=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          if [ -n "${OPENAI_API_KEY}" ] && [ -n "${DEEPSEEK_API_KEY}" ] && [ -n "${ANTHROPIC_API_KEY}" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping provider smoke: provider secrets are not configured."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: ${{ steps.precheck.outputs.should_run == 'true' }}
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        if: ${{ steps.precheck.outputs.should_run == 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        if: ${{ steps.precheck.outputs.should_run == 'true' }}
+        run: npm ci
+
+      - name: Start API server
+        if: ${{ steps.precheck.outputs.should_run == 'true' }}
+        run: |
+          npm start > /tmp/ai-access-api.log 2>&1 &
+          echo $! > /tmp/ai-access-api.pid
+
+      - name: Wait for health endpoint
+        if: ${{ steps.precheck.outputs.should_run == 'true' }}
+        run: |
+          for i in {1..30}; do
+            if curl -fsS "$BASE_URL/health" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server did not become healthy in time" >&2
+          cat /tmp/ai-access-api.log >&2 || true
+          exit 1
+
+      - name: Provider smoke checks
+        if: ${{ steps.precheck.outputs.should_run == 'true' }}
+        run: ./scripts/smoke-local.sh
+
+      - name: Stop API server
+        if: ${{ always() && steps.precheck.outputs.should_run == 'true' }}
+        run: |
+          if [ -f /tmp/ai-access-api.pid ]; then
+            kill "$(cat /tmp/ai-access-api.pid)" || true
+          fi
+          pkill -f "node api/index.js" || true
